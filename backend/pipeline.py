@@ -1,3 +1,4 @@
+import time
 import os
 import json
 import httpx
@@ -98,6 +99,13 @@ async def fetch_pubmed_evidence(keywords: str) -> list[dict]:
         return []
 
 
+FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.8-flash-lite",
+    "gemini-3.5-flash",
+]
+
+
 def analyze_post_with_llm(text: str, evidence_context: str = "") -> dict:
     prompt = f"""
 You are VeriSense, an AI media literacy engine strictly restricted to SCIENTIFIC and FINANCIAL information.
@@ -114,16 +122,30 @@ Retrieved Reference Context (if any):
 Post Text:
 \"\"\"{text}\"\"\"
 """
-    response = client.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=PostAnalysis,
-            temperature=0.1,
-        ),
-    )
-    return json.loads(response.text)
+    last_error = None
+    for model_name in FALLBACK_MODELS:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=PostAnalysis,
+                        temperature=0.1,
+                    ),
+                )
+                return json.loads(response.text)
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                # Retry briefly on 503/429, or jump straight to fallback model on 404/overload
+                if "503" in err_str or "429" in err_str:
+                    time.sleep(1.5)
+                    continue
+                break
+
+    raise RuntimeError(f"All Gemini models unavailable right now: {last_error}")
 
 
 async def run_pipeline(posts: list[dict]) -> dict:
