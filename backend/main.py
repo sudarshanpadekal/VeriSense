@@ -15,7 +15,7 @@ app.add_middleware(
 
 class HandleRequest(BaseModel):
     handle: str
-    limit: int = 10
+    limit: int = 5
 
 
 class ManualPostsRequest(BaseModel):
