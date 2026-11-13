@@ -1,3 +1,4 @@
+import asyncio
 import time
 import os
 import json
@@ -100,8 +101,8 @@ async def fetch_pubmed_evidence(keywords: str) -> list[dict]:
 
 
 FALLBACK_MODELS = [
-    "gemini-3.8-flash",
     "gemini-3.8-flash-lite",
+    "gemini-3.8-flash",
     "gemini-3.5-flash",
 ]
 
@@ -124,44 +125,35 @@ Post Text:
 """
     last_error = None
     for model_name in FALLBACK_MODELS:
-        for attempt in range(2):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=PostAnalysis,
-                        temperature=0.1,
-                    ),
-                )
-                return json.loads(response.text)
-            except Exception as e:
-                last_error = e
-                err_str = str(e)
-                # Retry briefly on 503/429, or jump straight to fallback model on 404/overload
-                if "503" in err_str or "429" in err_str:
-                    time.sleep(1.5)
-                    continue
-                break
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=PostAnalysis,
+                    temperature=0.1,
+                ),
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            last_error = e
+            # Immediately try the next fallback model instead of sleeping
+            continue
 
     raise RuntimeError(f"All Gemini models unavailable right now: {last_error}")
 
 
-async def run_pipeline(posts: list[dict]) -> dict:
-    eligible_results = []
-    excluded_results = []
-
-    for post in posts:
-        initial = analyze_post_with_llm(post["text"])
+async def _process_single_post(post: dict, semaphore: asyncio.Semaphore) -> tuple[str, dict]:
+    async with semaphore:
+        initial = await asyncio.to_thread(analyze_post_with_llm, post["text"])
 
         if not initial["is_eligible"] or initial["domain"] not in ("Science", "Finance"):
-            excluded_results.append({
+            return ("excluded", {
                 "text": post["text"],
                 "domain": initial["domain"],
                 "reason": initial["exclusion_reason"] or f"Out of scope ({initial['domain']})",
             })
-            continue
 
         evidence_links = []
         if initial["domain"] == "Science" and initial["search_keywords"]:
@@ -170,14 +162,24 @@ async def run_pipeline(posts: list[dict]) -> dict:
                 evidence_str = "\n".join(
                     [f"- {e['title']} ({e['url']})" for e in evidence_links]
                 )
-                initial = analyze_post_with_llm(post["text"], evidence_str)
+                initial = await asyncio.to_thread(analyze_post_with_llm, post["text"], evidence_str)
 
-        eligible_results.append({
+        return ("eligible", {
             "text": post["text"],
             "author": post.get("author", "Manual Input"),
             "analysis": initial,
             "evidence_links": evidence_links,
         })
+
+
+async def run_pipeline(posts: list[dict]) -> dict:
+    # Limit to 4 concurrent workers to stay safely within free-tier RPM limits
+    semaphore = asyncio.Semaphore(4)
+    tasks = [_process_single_post(post, semaphore) for post in posts]
+    outcomes = await asyncio.gather(*tasks)
+
+    eligible_results = [item for status, item in outcomes if status == "eligible"]
+    excluded_results = [item for status, item in outcomes if status == "excluded"]
 
     return {
         "summary": {
