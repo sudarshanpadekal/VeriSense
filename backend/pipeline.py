@@ -106,7 +106,14 @@ FALLBACK_MODELS = [
     "gemini-3.5-flash",
 ]
 
-def _call_groq_fallback(prompt: str) -> dict:
+GROQ_MODELS = [
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+]
+
+
+def _call_groq(prompt: str) -> dict:
     groq_key = os.getenv("GROQ_API_KEY")
     if not groq_key:
         raise RuntimeError("GROQ_API_KEY not found in .env")
@@ -124,26 +131,37 @@ Return ONLY a valid JSON object matching this exact schema:
   "explanation": "2-3 sentence evidence-grounded explanation"
 }
 """
-    resp = httpx.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {groq_key}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "openai/gpt-oss-120b",
-            "messages": [
-                {"role": "system", "content": schema_instruction},
-                {"role": "user", "content": prompt},
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1,
-        },
-        timeout=20.0,
-    )
-    resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"]
-    return json.loads(content)
+    last_err = None
+    for model_name in GROQ_MODELS:
+        try:
+            resp = httpx.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {groq_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": schema_instruction},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.1,
+                },
+                timeout=20.0,
+            )
+            if resp.status_code == 429:
+                time.sleep(2.0)
+                continue
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            return json.loads(content)
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"All Groq models failed: {last_err}")
 
 def analyze_post_with_llm(text: str, evidence_context: str = "") -> dict:
     prompt = f"""
@@ -151,9 +169,9 @@ You are VeriSense, an AI media literacy engine strictly restricted to SCIENTIFIC
 
 STRICT SCOPE RULES:
 1. Classify the post into: Science, Finance, Politics, Religion, or Other.
-2. EXCLUDE (is_eligible = false) any post that involves politics, government policy debates, elections, religion, or general chatter—even if it mentions science or money.
+2. EXCLUDE (is_eligible = false) any post involving politics, government policy debates, elections, religion, or general chatter.
 3. Only posts strictly about scientific/health claims or financial/investment claims get is_eligible = true.
-4. For eligible posts, extract the factual claim, identify observable persuasion/manipulation techniques, and evaluate credibility based on retrieved evidence and established consensus. Do not mark a claim false merely for lacking evidence; use 'Unverified (Insufficient Evidence)' when appropriate.
+4. For eligible posts, extract the factual claim, identify observable persuasion/manipulation techniques, and evaluate credibility based on retrieved evidence and established consensus.
 
 Retrieved Reference Context (if any):
 {evidence_context if evidence_context else "None retrieved yet."}
@@ -161,28 +179,26 @@ Retrieved Reference Context (if any):
 Post Text:
 \"\"\"{text}\"\"\"
 """
-    last_error = None
-    for model_name in FALLBACK_MODELS:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=PostAnalysis,
-                    temperature=0.1,
-                ),
-            )
-            return json.loads(response.text)
-        except Exception as e:
-            last_error = e
-            continue
-
-    # If all Gemini models fail (503/429), immediately fail over to Groq
+    # Primary: Groq (high RPM/RPD free tier)
     try:
-        return _call_groq_fallback(prompt)
+        return _call_groq(prompt)
     except Exception as groq_err:
-        raise RuntimeError(f"Both Gemini ({last_error}) and Groq ({groq_err}) failed.")
+        # Secondary: Gemini fallback
+        for model_name in FALLBACK_MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=PostAnalysis,
+                        temperature=0.1,
+                    ),
+                )
+                return json.loads(response.text)
+            except Exception:
+                continue
+        raise RuntimeError(f"Groq failed ({groq_err}) and Gemini quota is exhausted.")
 
 
 async def _process_single_post(post: dict, semaphore: asyncio.Semaphore) -> tuple[str, dict]:
