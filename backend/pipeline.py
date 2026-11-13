@@ -106,6 +106,44 @@ FALLBACK_MODELS = [
     "gemini-3.5-flash",
 ]
 
+def _call_groq_fallback(prompt: str) -> dict:
+    groq_key = os.getenv("GROQ_API_KEY")
+    if not groq_key:
+        raise RuntimeError("GROQ_API_KEY not found in .env")
+
+    schema_instruction = """
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "domain": "Science | Finance | Politics | Religion | Other",
+  "is_eligible": true or false,
+  "exclusion_reason": "string (empty if eligible)",
+  "extracted_claim": "string",
+  "search_keywords": "string (2-4 keywords if Science, else empty)",
+  "manipulation_techniques": ["list", "of", "strings"],
+  "verdict": "Supported | Contradicted | Misleading / Missing Context | Unverified (Insufficient Evidence) | Not Assessable",
+  "explanation": "2-3 sentence evidence-grounded explanation"
+}
+"""
+    resp = httpx.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {groq_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": "openai/gpt-oss-120b",
+            "messages": [
+                {"role": "system", "content": schema_instruction},
+                {"role": "user", "content": prompt},
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.1,
+        },
+        timeout=20.0,
+    )
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"]
+    return json.loads(content)
 
 def analyze_post_with_llm(text: str, evidence_context: str = "") -> dict:
     prompt = f"""
@@ -138,10 +176,13 @@ Post Text:
             return json.loads(response.text)
         except Exception as e:
             last_error = e
-            # Immediately try the next fallback model instead of sleeping
             continue
 
-    raise RuntimeError(f"All Gemini models unavailable right now: {last_error}")
+    # If all Gemini models fail (503/429), immediately fail over to Groq
+    try:
+        return _call_groq_fallback(prompt)
+    except Exception as groq_err:
+        raise RuntimeError(f"Both Gemini ({last_error}) and Groq ({groq_err}) failed.")
 
 
 async def _process_single_post(post: dict, semaphore: asyncio.Semaphore) -> tuple[str, dict]:
